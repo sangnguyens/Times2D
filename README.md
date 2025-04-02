@@ -1,4 +1,8 @@
 # Times2D
+## 📄 Paper
+
+Our paper describing Times2D has been accepted to **AAAI 2025** and is now available on arXiv:  
+🔗 [Times2D: Multi-Period Decomposition and Derivative Mapping for General Time Series Forecasting](https://arxiv.org/abs/2504.00118)
 
 ## Overview
 
