@@ -3,11 +3,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 import math
-from positional_encodings.torch_encodings import PositionalEncoding2D
-from utils.magnitude_max_pooling import magnitude_max_pooling_1d
 
+class DataEmbedding_inverted(nn.Module):
+    def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+        super(DataEmbedding_inverted, self).__init__()
+        self.value_embedding = nn.Linear(c_in, d_model)
+        self.dropout = nn.Dropout(p=dropout)
 
+    def forward(self, x, x_mark):
+        x = x.permute(0, 2, 1)
+        # x: [Batch Variate Time]
+        if x_mark is None:
+           
+            x = self.value_embedding(x)
+            
+        else:
+     
+            # the potential to take covariates (e.g. timestamps) as tokens
+            x = self.value_embedding(torch.cat([x, x_mark.permute(0, 2, 1)], 1)) 
+        # x: [Batch Variate d_model]
+        return self.dropout(x)
 
+    
+    
+    
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEmbedding, self).__init__()
@@ -26,13 +45,11 @@ class PositionalEmbedding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-
         return self.pe[:, :x.size(1)]
 
 
 class TokenEmbedding(nn.Module):
     def __init__(self, c_in, d_model):
-        
         super(TokenEmbedding, self).__init__()
         padding = 1 if torch.__version__ >= '1.5.0' else 2
         self.tokenConv = nn.Conv1d(in_channels=c_in, out_channels=d_model,
@@ -79,7 +96,6 @@ class TemporalEmbedding(nn.Module):
         month_size = 13
 
         Embed = FixedEmbedding if embed_type == 'fixed' else nn.Embedding
-        
         if freq == 't':
             self.minute_embed = Embed(minute_size, d_model)
         self.hour_embed = Embed(hour_size, d_model)
@@ -87,7 +103,7 @@ class TemporalEmbedding(nn.Module):
         self.day_embed = Embed(day_size, d_model)
         self.month_embed = Embed(month_size, d_model)
 
-    def forward(self, x): # x_mark [B, Seq, Ntime] = [32 96 4]
+    def forward(self, x):
         x = x.long()
         minute_x = self.minute_embed(x[:, :, 4]) if hasattr(
             self, 'minute_embed') else 0.
@@ -95,10 +111,11 @@ class TemporalEmbedding(nn.Module):
         weekday_x = self.weekday_embed(x[:, :, 2])
         day_x = self.day_embed(x[:, :, 1])
         month_x = self.month_embed(x[:, :, 0])
-        return hour_x + weekday_x + day_x + month_x + minute_x  # all shape [B, Seq, d_model]
+
+        return hour_x + weekday_x + day_x + month_x + minute_x
 
 
-class TimeFeatureEmbedding(nn.Module):  # x_mark [B, Seq, Ntime] = [32 96 4]
+class TimeFeatureEmbedding(nn.Module):
     def __init__(self, d_model, embed_type='timeF', freq='h'):
         super(TimeFeatureEmbedding, self).__init__()
 
@@ -106,33 +123,65 @@ class TimeFeatureEmbedding(nn.Module):  # x_mark [B, Seq, Ntime] = [32 96 4]
                     'm': 1, 'a': 1, 'w': 2, 'd': 3, 'b': 3}
         d_inp = freq_map[freq]
         self.embed = nn.Linear(d_inp, d_model, bias=False)
+
     def forward(self, x):
-        return self.embed(x)   # x_mark [B, Seq, d_model] = [32 96 d_model]
+        return self.embed(x)
 
 
-    
-"""The CustomEmbedding is used by the electricity dataset and app flow dataset for long range forecasting."""
-class CustomEmbedding(nn.Module):
-    def __init__(self, c_in, d_model, temporal_size, seq_num, dropout=0.1):
-        super(CustomEmbedding, self).__init__()
-
+class DataEmbedding(nn.Module):
+    def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+        super(DataEmbedding, self).__init__()
+        self.c_in = c_in
+        self.d_model = d_model
         self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)
         self.position_embedding = PositionalEmbedding(d_model=d_model)
-        self.temporal_embedding = nn.Linear(temporal_size, d_model)
-        self.seqid_embedding = nn.Embedding(seq_num, d_model)
-
+        self.temporal_embedding = TemporalEmbedding(d_model=d_model, embed_type=embed_type,
+                                                    freq=freq) if embed_type != 'timeF' else TimeFeatureEmbedding(
+            d_model=d_model, embed_type=embed_type, freq=freq)
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x, x_mark):
-        x = self.value_embedding(x) + self.position_embedding(x) + self.temporal_embedding(x_mark[:, :, :-1])\
-            + self.seqid_embedding(x_mark[:, :, -1].long())
+        _, _, N = x.size()
+        if N == self.c_in:
+            if x_mark is None:
+                x = self.value_embedding(x) + self.position_embedding(x)
+            else:
+                x = self.value_embedding(
+                    x) + self.temporal_embedding(x_mark) + self.position_embedding(x)
+        elif N == self.d_model:
+            if x_mark is None:
+                x = x + self.position_embedding(x)
+            else:
+                x = x + self.temporal_embedding(x_mark) + self.position_embedding(x)
 
         return self.dropout(x)
-    
-    
-class DataEmbedding(nn.Module):
-    def __init__(self, c_in, d_model, embed_type='timeF', freq='h', dropout=0.1):
-        super(DataEmbedding, self).__init__()
+
+
+class DataEmbedding_ms(nn.Module):
+    def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+        super(DataEmbedding_ms, self).__init__()
+
+        self.value_embedding = TokenEmbedding(c_in=1, d_model=d_model)
+        self.position_embedding = PositionalEmbedding(d_model=d_model)
+        self.temporal_embedding = TemporalEmbedding(d_model=d_model, embed_type=embed_type,
+                                                    freq=freq) if embed_type != 'timeF' else TimeFeatureEmbedding(
+            d_model=d_model, embed_type=embed_type, freq=freq)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x, x_mark):
+        B, T, N = x.shape
+        x1 = self.value_embedding(x.reshape(0, 2, 1).reshape(B * N, T).unsqueeze(-1)).reshape(B, N, T, -1).permute(0, 2,
+                                                                                                                   1, 3)
+        if x_mark is None:
+            x = x1
+        else:
+            x = x1 + self.temporal_embedding(x_mark)
+        return self.dropout(x)
+
+
+class DataEmbedding_wo_pos(nn.Module):
+    def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+        super(DataEmbedding_wo_pos, self).__init__()
 
         self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)
         self.position_embedding = PositionalEmbedding(d_model=d_model)
@@ -141,58 +190,19 @@ class DataEmbedding(nn.Module):
             d_model=d_model, embed_type=embed_type, freq=freq)
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x, x_mark):  # x_mark is not None
+    def forward(self, x, x_mark):
+        if x is None and x_mark is not None:
+            return self.temporal_embedding(x_mark)
         if x_mark is None:
-            
-            x = self.value_embedding(x) + self.position_embedding(x)
-        else:
-            
-            x = self.value_embedding(x) + self.temporal_embedding(x_mark) + self.position_embedding(x)
-        return self.dropout(x)
-
-
-class DataEmbedding_inverted(nn.Module):
-    def __init__(self, c_in, d_model, embed_type='timeF', freq='h', dropout=0.1):
-        super(DataEmbedding_inverted, self).__init__()
-        self.value_embedding = nn.Linear(c_in, d_model)
-        self.dropout = nn.Dropout(p=dropout)
-
-    def forward(self, x, x_mark):
-        x = x.permute(0, 2, 1)
-        # x: [Batch N Seq]
-
-        if x_mark is None:   # x_mark is not None
             x = self.value_embedding(x)
         else:
-                x = self.value_embedding(torch.cat([x, x_mark.permute(0, 2, 1)], 1))   # [B, (N + N(time),d_model], like [32, 7+4, 128] 
-        # x: [Batch Variate d_model]
+            x = self.value_embedding(x) + self.temporal_embedding(x_mark)
         return self.dropout(x)
 
 
-class DataEmbedding_wo_pos(nn.Module):
-    def __init__(self, Embedding_types, c_in, d_model, embed_type='timeF', freq='h', dropout=0.1):
-        super(DataEmbedding_wo_pos, self).__init__()
-
-        self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)   # [B, Seq, d_model]
-        self.position_embedding = PositionalEmbedding(d_model=d_model)
-        self.temporal_embedding = TemporalEmbedding(d_model=d_model, embed_type=embed_type,
-                                                    freq=freq) if embed_type != 'timeF' else TimeFeatureEmbedding(
-            d_model=d_model, embed_type=embed_type, freq=freq)                # [B, Seq, d_model]
-        self.dropout = nn.Dropout(p=dropout)
-    def forward(self, x, x_mark):
-        
-        if x_mark is None:  # x_mark is not None
-            x = self.value_embedding(x)
-        else:   # x_mark is not None
-            x = self.value_embedding(x) + self.temporal_embedding(x_mark) 
-       
-
-        return self.dropout(x)
-
-
-class PatchEmbedding(nn.Module):
+class PatchEmbedding_crossformer(nn.Module):
     def __init__(self, d_model, patch_len, stride, padding, dropout):
-        super(PatchEmbedding, self).__init__()
+        super(PatchEmbedding_crossformer, self).__init__()
         # Patching
         self.patch_len = patch_len
         self.stride = stride
@@ -216,99 +226,56 @@ class PatchEmbedding(nn.Module):
         # Input encoding
         x = self.value_embedding(x) + self.position_embedding(x)
         return self.dropout(x), n_vars
+
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, d_model, patch_len, stride, dropout):
+        super(PatchEmbedding, self).__init__()
+        # Patching
+        self.patch_len = patch_len
+        self.stride = stride
+        self.padding_patch_layer = nn.ReplicationPad1d((0, stride))
+
+        # Backbone, Input encoding: projection of feature vectors onto a d-dim vector space
+        self.value_embedding = TokenEmbedding(patch_len, d_model)
+
+        # Positional embedding
+        self.position_embedding = PositionalEmbedding(d_model)
+
+        # Residual dropout
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # do patching
+        n_vars = x.shape[1]
+        x = self.padding_patch_layer(x)
+        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
+        # Input encoding
+        x = self.value_embedding(x) + self.position_embedding(x)
+        return self.dropout(x), n_vars
     
-    
-    
-class WITRAN_Temporal_Embedding(nn.Module):
-    def __init__(self, d_inp, d_model, embed_type='fixed', freq='h', dropout=0.1):
-        super(WITRAN_Temporal_Embedding, self).__init__()
 
-        self.temporal_embedding = TemporalEmbedding(d_model=d_model, embed_type=embed_type,
-                                                    freq=freq) if embed_type != 'timeF' \
-            else nn.Linear(d_inp, d_model, bias=False)
-        self.dropout = nn.Dropout(p=dropout)
+class DataEmbedding_inverted11(nn.Module):
+    def __init__(self, seq_len, d_model,  dropout=0.1):
+        super(DataEmbedding_inverted11, self).__init__()
+        self.linear1 = nn.Linear(seq_len, d_model*2)
+        self.linear2 = nn.Linear(d_model*2, d_model*4)
+        self.linear3 = nn.Linear(d_model*4, d_model)
+        #self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x_mark):
-        return self.dropout(self.temporal_embedding(x_mark))
-    
-    
-    
-class DataEmbedding_FeaturePatching(nn.Module):
-    def __init__(self, seq_len,  patch_size,  embed_dim = 512, embed_type='fixed', freq='h', dropout=0.1):
-        super(DataEmbedding_FeaturePatching, self).__init__()
-        self.seq_len = seq_len 
-        self.patch_size = patch_size
-        self.n_of_patches = (seq_len - patch_size)//(patch_size//2) + 1
-        self.inner_dim = patch_size * 10
-        self.embed_dim = embed_dim
-
-        self.conv1 = nn.Conv1d(1, 3, kernel_size=5)
-        self.conv2 = nn.Conv1d(1, 3, kernel_size=9)
-        self.conv3 = nn.Conv1d(1, 3, kernel_size=15)
-        self.gelu1 = nn.GELU()
-        self.gelu2 = nn.GELU()
-        self.fc1 = nn.Linear(self.inner_dim, embed_dim*4)
-        self.fc2 = nn.Linear(embed_dim*4, embed_dim)
-        self.pe  = PositionalEncoding2D(embed_dim)
-        self.dropout = nn.Dropout(p=dropout)
-
-        self.sigm = nn.GELU()
-
-    def forward(self, x, x_mark):
-        B, L, N = x.shape
-        x = x.permute(0, 2, 1)
-        # x: [Batch Variate Time]
-
-        if x_mark is not None:
-            N += x_mark.shape[2]
-            x = torch.cat([x, x_mark.permute(0, 2, 1)], 1)
-
-        x = x.reshape(-1, 1, L)
-        x_1 = F.pad(x, (4, 0), mode = 'replicate')
-        x_1 = self.conv1(x_1)
-        x_2 = F.pad(x, (8, 0), mode = 'replicate')
-        x_2 = self.conv2(x_2)
-        x_3 = F.pad(x, (14, 0), mode = 'replicate')
-        x_3 = self.conv3(x_3)
-        x_1 = F.pad(x_1, (2, 0), mode = 'constant', value = 0)
-        x_2 = F.pad(x_2, (4, 0), mode = 'constant', value = 0)
-        x_3 = F.pad(x_3, (6, 0), mode = 'constant', value = 0)
-
-        x_1 = magnitude_max_pooling_1d(x_1, 3, 1)
-        x_2 = magnitude_max_pooling_1d(x_2, 5, 1)
-        x_3 = magnitude_max_pooling_1d(x_3, 7, 1)
-
+    def forward(self, x_enc, x_mark_enc = None):
         
-
-        x_1 = x_1.reshape(B, N, 3, L)
-        x_2 = x_2.reshape(B, N, 3, L)
-        x_3 = x_3.reshape(B, N, 3, L)
-        x = x.reshape(B, N, 1, L)
+        x_enc = x_enc.permute(0, 2, 1)  # [B, N, Seq]
+    
         
+        x_enc = self.linear1(x_enc)
+        x_enc = torch.tanh(x_enc)
+        
+        x_enc = self.linear2(x_enc)
+        x_enc = torch.tanh(x_enc)
 
-        x_1 = x_1.unfold(3, self.patch_size, self.patch_size//2)
-        x_2 = x_2.unfold(3, self.patch_size, self.patch_size//2)
-        x_3 = x_3.unfold(3, self.patch_size, self.patch_size//2)
-        x = x.unfold(3, self.patch_size, self.patch_size//2)
-
-
-        x_1 = x_1.permute(0, 1, 3, 2, 4)
-        x_2 = x_2.permute(0, 1, 3, 2, 4)
-        x_3 = x_3.permute(0, 1, 3, 2, 4)
-        x = x.permute(0, 1, 3, 2, 4)
-
-
-        x = torch.cat([x, x_1, x_2, x_3], dim = 3)
-
-
-        x = x.reshape(B, N, self.n_of_patches, -1)
-        x = self.gelu1(self.fc1(x))
-        x = self.fc2(x)
-        x = self.pe(x) + x #apply 2D positional encodings
-
-        x = x.reshape(B, -1, self.embed_dim)
-
-        return self.dropout(x)
-
-    
-    
+        x_enc = self.linear3(x_enc)
+        x_enc = torch.tanh(x_enc)
+        
+        return x_enc
